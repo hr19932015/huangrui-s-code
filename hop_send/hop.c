@@ -1,0 +1,453 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/errno.h>
+#include <sys/time.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+
+#include <net/if.h>
+#include <net/ethernet.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
+#include <netinet/if_ether.h>
+#include <netpacket/packet.h>
+#include <netdb.h>
+
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <time.h>
+#include <sys/time.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <resolv.h>
+#include <signal.h>
+#include <getopt.h>
+#ifdef HAVE_CONFIG_H
+#include <config.h>
+#endif
+
+#define My_ETHER_ADDR_LEN 6
+struct my_ether_addr {
+	uint8_t addr_bytes[My_ETHER_ADDR_LEN];
+}__attribute__((__packed__));
+
+struct ether_hdr {
+	struct my_ether_addr d_addr;
+	struct my_ether_addr s_addr;
+	uint16_t ether_type;
+}__attribute__((__packed__));
+
+#define HOPv1		0xC1
+#define TYPE_DATA	0x01
+#define TYPE_ACK	0x02
+#define TYPE_BYSN	0x03
+struct Hop_header
+{
+	struct ether_hdr ether_header;
+	uint8_t hop_ver;	
+	uint8_t type;	
+	uint16_t block_sequence;
+	uint16_t piece_sequence;
+	uint16_t piece_size;
+}__attribute__((__packed__));
+typedef struct Hop_header Hop_header_t;
+
+#define PHYSICALPORT_DOWN 	"eth2"
+#define PHYSICALPORT_DOWN_MAC	"000002"
+
+#define BUFSIZE			2048 	//This number must be bigger than 1500. 
+#define PIECE_SIZE 		1024 	//The Unit is byte! It < (BUFSIZE - header's length).
+#define PIECE_NUMBER	1000	//It means how many packets sent in a turn! 
+
+uint8_t 	send_mbuf[PIECE_NUMBER][BUFSIZE]={0};	//These bufs store the packets which will be sent, including header and data!
+uint16_t 	send_mbuf_piece_size[PIECE_NUMBER]={0};
+uint16_t	send_mbuf_piece_number=0;
+
+static int 	RecvBufSize=BUFSIZE;
+
+uint8_t 	receive_mbuf[PIECE_NUMBER][BUFSIZE]={0};
+uint16_t 	receive_mbuf_piece_size[PIECE_NUMBER]={0};
+uint16_t	receive_mbuf_piece_number=0;
+
+uint8_t		receive_bitmap[PIECE_NUMBER]={0};
+
+FILE *fp_read;
+
+uint16_t blockcounter=0;
+uint8_t next_block_ok=0;
+
+#define port_name_length 9
+struct PORT
+{
+	char name[port_name_length];
+	struct my_ether_addr addr;
+	int sockfd_send;
+	int sockfd_receive;
+	struct sockaddr Port;
+};
+typedef struct PORT port_t;
+
+port_t port_down;
+
+//线程函数
+void *thread_send();
+void *thread_recv();
+
+void *bysn_resend();
+
+uint8_t send_bysn_waiting_flag=0;
+
+/*****************************************
+* 功能描述：物理网卡混杂模式属性操作
+*****************************************/
+static int Ethernet_SetPromisc(const char *pcIfName,int fd,int iFlags)
+{
+	int iRet = -1;
+	struct ifreq stIfr;
+	//获取接口属性标志位
+	strcpy(stIfr.ifr_name,pcIfName);
+	iRet = ioctl(fd,SIOCGIFFLAGS,&stIfr);
+	if(0 > iRet){
+		perror("[Error]Get Interface Flags");   
+		return -1;
+	}
+	if(0 == iFlags){
+		//取消混杂模式
+		stIfr.ifr_flags &= ~IFF_PROMISC;
+	}
+	if(iFlags>0){
+		//设置为混杂模式
+		stIfr.ifr_flags |= IFF_PROMISC;
+	}
+	//设置接口标志
+	iRet = ioctl(fd,SIOCSIFFLAGS,&stIfr);
+	if(0 > iRet){
+		perror("[Error]Set Interface Flags");
+		return -1;
+	}
+	return 0;
+}
+
+/*****************************************
+* 功能描述：创建原始套接字
+*****************************************/
+static int Ethernet_InitSocket(char Physical_Port[port_name_length])
+{
+	int iRet = -1;
+	int fd = -1;
+	struct ifreq stIf;
+	struct sockaddr_ll stLocal = {0};
+	//创建SOCKET
+	fd = socket(PF_PACKET,SOCK_RAW,htons(ETH_P_ALL));
+	if (0 > fd){
+		perror("[Error]Initinate L2 raw socket");
+		return -1;
+	}
+	//网卡混杂模式设置
+	Ethernet_SetPromisc(Physical_Port,fd,1);
+	//设置SOCKET选项
+	iRet = setsockopt(fd,SOL_SOCKET,SO_RCVBUF,&RecvBufSize,sizeof(int));
+	if (0 > iRet){
+		perror("[Error]Set socket option");
+		close(fd);
+	}
+	
+	//获取物理网卡接口索引
+	strcpy(stIf.ifr_name,Physical_Port);
+	iRet = ioctl(fd,SIOCGIFINDEX,&stIf);
+	if (0 > iRet){
+		perror("[Error]Ioctl operation");
+		close(fd);
+		return -1;
+	}
+	//绑定物理网卡
+	stLocal.sll_family = PF_PACKET;
+	stLocal.sll_ifindex = stIf.ifr_ifindex;
+	stLocal.sll_protocol = htons(ETH_P_ALL);
+	iRet = bind(fd,(struct sockaddr *)&stLocal,sizeof(stLocal));
+	if (0 > iRet){
+		perror("[Error]Bind the interface");
+		close(fd);
+		return -1;
+	}
+	return fd;   
+}
+
+
+int main(int argc,char *argv[])
+{	
+//---------------------------------------------------------------------
+	memcpy(port_down.name,PHYSICALPORT_DOWN,port_name_length);
+	memcpy(port_down.addr.addr_bytes,PHYSICALPORT_DOWN_MAC,My_ETHER_ADDR_LEN);
+	port_down.sockfd_receive=Ethernet_InitSocket(port_down.name);
+	if((port_down.sockfd_send=socket(PF_PACKET,SOCK_PACKET,htons(ETH_P_ALL)))==-1)
+	{
+		printf("Socket Error\n");
+		exit(0);
+	}
+	memset(&port_down.Port,0,sizeof(port_down.Port));
+	strcpy(port_down.Port.sa_data,port_down.name);
+//---------------------------------------------------------------------
+
+	pthread_t pthread_send;
+	if(pthread_create(&pthread_send, NULL, thread_send, (void *)&port_down)!=0)
+	{
+		perror("Creation of send thread failed.");
+	}
+	
+	pthread_t pthread_recv;
+	if(pthread_create(&pthread_recv, NULL, thread_recv, (void *)&port_down)!=0)
+	{
+		perror("Creation of receive thread failed.");
+	}
+
+	pthread_t pthread_bysn_resend;
+	if(pthread_create(&pthread_bysn_resend, NULL,bysn_resend,(void *)&port_down)!=0)
+	{
+		perror("Creation of receive thread failed.");
+	}
+
+	
+	while(1)
+	{
+		
+	}
+	
+	exit(0);
+	return (EXIT_SUCCESS);
+}
+
+//The is designed to the special prot!
+void load_one_block_to_send_buf(FILE *fp,port_t *port)
+{
+	uint16_t piececounter=0;
+	uint16_t real_piece_size=0;
+	
+	//Tell the program how many pieces in the bufs!
+	send_mbuf_piece_number=0;
+	
+	while(!feof(fp) && piececounter<PIECE_NUMBER)
+	{	
+		Hop_header_t * hop_header =(Hop_header_t *)send_mbuf[piececounter];
+		
+		memset(&hop_header->ether_header.d_addr,0xF,sizeof(struct my_ether_addr));
+		memcpy(&hop_header->ether_header.s_addr,port->addr.addr_bytes,sizeof(struct my_ether_addr));
+		hop_header->ether_header.ether_type=0x0008;
+		
+		hop_header->hop_ver=HOPv1;
+		hop_header->type=TYPE_DATA;
+		hop_header->piece_sequence=piececounter;
+		hop_header->block_sequence=blockcounter;
+		real_piece_size=fread(send_mbuf[piececounter]+sizeof(Hop_header_t),1,PIECE_SIZE,fp);
+		hop_header->piece_size=real_piece_size;
+		send_mbuf_piece_size[piececounter]=real_piece_size;
+		send_mbuf_piece_number++;
+		piececounter++;
+	}
+}
+
+#define send_dealy_usleep 1
+void flush_send_buf(port_t * port){
+	int piececounter=0;
+	for(piececounter=0; piececounter<send_mbuf_piece_number; piececounter++){
+	//	printf("[%s]Please input Enter to send a block\n",__func__);getchar();
+		sendto(port->sockfd_send,send_mbuf[piececounter],send_mbuf_piece_size[piececounter]+sizeof(struct Hop_header),0,&port->Port,sizeof(port->Port));
+		usleep(send_dealy_usleep );
+	}
+}
+void re_flush_send_buf(port_t * port,uint8_t receive_bitmap[PIECE_NUMBER]){
+	int piececounter=0;
+	for(piececounter=0; piececounter<send_mbuf_piece_number; piececounter++){
+		if(receive_bitmap[piececounter]==0)
+		{
+	//		printf("[%s]Please input Enter to send a block\n",__func__);getchar();
+			sendto(port->sockfd_send,send_mbuf[piececounter],send_mbuf_piece_size[piececounter]+sizeof(struct Hop_header),0,&port->Port,sizeof(port->Port));
+		}
+		usleep(send_dealy_usleep);
+	}
+}
+
+
+uint64_t bysn_serial_number=0;
+struct bysn_content{
+	uint16_t blockcounter;
+	uint16_t piececounter;
+	uint64_t serial_number;
+}__attribute__((__packed__));
+typedef struct bysn_content bysn_content_t;
+
+void send_bysn(port_t * port)
+{
+	if(send_mbuf_piece_number==0)
+	{
+		printf("[From %s]END of bysn!\n",__func__);
+	}	
+	
+	uint8_t bysn_mbuf[BUFSIZE]={0};
+	Hop_header_t * hop_header =(Hop_header_t *)bysn_mbuf;
+	memset(&hop_header->ether_header.d_addr,0xF,sizeof(struct my_ether_addr));
+	memcpy(&hop_header->ether_header.s_addr,port->addr.addr_bytes,sizeof(struct my_ether_addr));
+	hop_header->ether_header.ether_type=0x0008;
+	hop_header->hop_ver=HOPv1;
+	hop_header->type=TYPE_BYSN;
+	hop_header->piece_sequence=0;
+	hop_header->block_sequence=0;
+	
+	bysn_content_t * bysn_content=(bysn_content_t *)(bysn_mbuf+sizeof(Hop_header_t));
+	bysn_content->blockcounter=blockcounter;
+	bysn_content->piececounter=send_mbuf_piece_number;
+	bysn_content->serial_number=bysn_serial_number++;
+	sendto(port->sockfd_send,bysn_mbuf,sizeof(Hop_header_t)+sizeof(bysn_content_t),0,&port->Port,sizeof(port->Port));
+	printf("[From %s]Send the Bysn!\n",__func__);
+}
+
+void *bysn_resend(void *port_point)
+{
+	port_t * port=(port_t*)port_point;
+	while(1)
+	{
+		while(send_bysn_waiting_flag==0);
+		usleep(1000000);
+		if(send_bysn_waiting_flag==1)
+		{
+			printf("[From %s]The Last Bysn is not successful! Resend it!\n",__func__);
+			send_bysn(port);
+		}
+	}
+	
+}
+
+
+struct ack_content{
+	uint8_t receive_bitmap[PIECE_NUMBER];
+	uint64_t serial_number_of_bysn;
+}__attribute__((__packed__));
+typedef struct ack_content ack_content_t;
+
+void send_ack()
+{
+	
+}
+
+void *thread_send(void * port_point)
+{
+	port_t * port=(port_t*)port_point;
+
+	//fp_read = fopen("send.txt","r");
+	fp_read= fopen("video_send.mp4","r");
+	//fp_read= fopen("ubuntu15.04.iso","r");
+
+	uint64_t packetcounter=0;
+	do{
+		load_one_block_to_send_buf(fp_read,port);
+		flush_send_buf(port);
+		printf("[From %s]blockcounter=%d send_mbuf_piece_number=%d packetcounter=%ld\n",__func__,blockcounter,send_mbuf_piece_number,packetcounter);
+		//Here we need to make sure all the packets have been received!------------
+		send_bysn(port);
+		send_bysn_waiting_flag=1;
+		next_block_ok=0;
+		while(next_block_ok==0);
+		//-------------------------------------------------------------------------
+		blockcounter++;
+		packetcounter+=send_mbuf_piece_number;
+	}while(send_mbuf_piece_number!=0);
+	
+	
+	printf("\n[From %s]***!!!***The file has been sent totally!\n",__func__);
+	
+	fclose(fp_read);
+	pthread_exit(NULL);
+}
+
+
+void process_DATA(Hop_header_t * hop_header)
+{
+	
+}
+void process_BYSN(Hop_header_t * hop_header)
+{
+	
+}
+void process_ACK(Hop_header_t * hop_header, port_t * port)
+{
+	ack_content_t * ack_content=(ack_content_t *)(hop_header+1);
+	
+	if(ack_content->serial_number_of_bysn!=bysn_serial_number)
+	{
+		printf("[From %s]The ACK is too old!\n",__func__);	
+		return;
+	}
+	int i;
+	send_bysn_waiting_flag=0;
+	printf("send_mbuf_piece_number=%d\n",send_mbuf_piece_number);
+	
+	int re_flush_send_buf_flag=0;
+	for(i=0;i<send_mbuf_piece_number;i++)
+	{
+		printf("ack_content->receive_bitmap[%d]=%d\n",i,ack_content->receive_bitmap[i]);
+		if(ack_content->receive_bitmap[i]==0)
+		{
+			re_flush_send_buf_flag=1;
+		}
+	}
+	
+	if(re_flush_send_buf_flag==1)
+	{
+		re_flush_send_buf(port,ack_content->receive_bitmap);
+		send_bysn(port);
+		send_bysn_waiting_flag=1;
+	}else{
+		printf("[From %s]Please send the next block!\n",__func__);
+	//	printf("Please input Enter to send the next block->>>\n");getchar();
+		next_block_ok=1;
+	}
+}
+
+void *thread_recv(void * port_point)
+{
+	port_t *port=(port_t *)port_point;
+	
+	socklen_t RecvSocketLen = 0;
+	int RecvLength=0;
+	uint8_t receive_temp_buf[BUFSIZE];
+	
+	uint64_t DATA_counter=0,BYSN_counter=0,ACK_counter=0;
+	
+	while(1)
+	{
+		while(RecvLength = recvfrom(port->sockfd_receive, receive_temp_buf, RecvBufSize, 0, NULL, &RecvSocketLen))
+		{
+			Hop_header_t * hop_header =(Hop_header_t *)receive_temp_buf;
+			if(memcmp(port->addr.addr_bytes,hop_header->ether_header.s_addr.addr_bytes,My_ETHER_ADDR_LEN)!=0&&hop_header->hop_ver==HOPv1)
+			{
+				if(hop_header->type==TYPE_DATA)
+				{
+					printf("[From %s]HOP_DATA[%ld]\n",__func__,++DATA_counter);
+					process_DATA(hop_header);
+				}
+				else if(hop_header->type==TYPE_BYSN)
+				{
+					printf("[From %s]HOP_BYSN[%ld]\n",__func__,++BYSN_counter);
+					process_BYSN(hop_header);
+				}
+				else if(hop_header->type==TYPE_ACK)
+				{
+					printf("[From %s]HOP_ACK[%ld]\n",__func__,++ACK_counter);
+					process_ACK(hop_header,port);
+				}
+				else
+				{
+					//NOT FOUND!
+				}
+			}
+		}
+	}
+	pthread_exit(NULL);
+}
